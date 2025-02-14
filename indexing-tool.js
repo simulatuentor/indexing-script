@@ -1,90 +1,104 @@
-// indexing-tool.js
-async function handleSubmit() {
-  const credentialsFile = document.getElementById('credentials').files[0];
-  const urls = document.getElementById('urls').value.split('\n').filter(url => url.trim() !== '');
-  const requestType = document.getElementById('request-type').value;
-  const responseDiv = document.getElementById('response');
+// indexing-tool.js - Versión mejorada
+const API_ENDPOINT = 'https://indexing.googleapis.com/v3/urlNotifications:publish';
 
-  if (!credentialsFile || urls.length === 0) {
-    responseDiv.innerHTML = '❌ Faltan credenciales o URLs';
-    return;
-  }
+async function procesarSolicitud() {
+  const archivoCredenciales = document.getElementById('credentials').files[0];
+  const listaURLs = document.getElementById('urls').value.split('\n').map(url => url.trim()).filter(Boolean);
+  const tipoSolicitud = document.getElementById('request-type').value;
+  const contenedorRespuesta = document.getElementById('response');
 
   try {
-    // Autenticación con Google
-    const credentials = JSON.parse(await credentialsFile.text());
-    const authToken = await authenticate(credentials);
+    // Validaciones básicas
+    if (!archivoCredenciales || !listaURLs.length) {
+      throw new Error('Faltan credenciales o URLs válidas');
+    }
+
+    // Autenticación
+    const { token } = await obtenerTokenAcceso(archivoCredenciales);
     
-    // Enviar solicitudes a la API
-    const results = await Promise.all(
-      urls.map(url => sendRequest(url, requestType, authToken))
-    );
+    // Procesamiento en lote
+    const resultados = [];
+    for (const url of listaURLs) {
+      const respuesta = await enviarPeticionAPI(url, tipoSolicitud, token);
+      resultados.push(respuesta);
+    }
 
     // Mostrar resultados
-    responseDiv.innerHTML = results.map(result => 
-      `✅ ${result.url}: ${result.status}`
+    contenedorRespuesta.innerHTML = resultados.map(res => 
+      `${res.exito ? '✅' : '❌'} ${res.url}: ${res.mensaje}`
     ).join('<br>');
 
   } catch (error) {
-    responseDiv.innerHTML = `❌ Error: ${error.message}`;
+    contenedorRespuesta.innerHTML = `⚠️ Error crítico: ${error.message}`;
+    console.error('Detalles del error:', error);
   }
 }
 
-async function authenticate(credentials) {
-  const { private_key, client_email } = credentials;
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claimSet = {
-    iss: client_email,
-    scope: 'https://www.googleapis.com/auth/indexing',
-    aud: 'https://oauth2.googleapis.com/token',
-    exp: Math.floor(Date.now() / 1000) + 3600,
-    iat: Math.floor(Date.now() / 1000)
-  };
-
+async function obtenerTokenAcceso(archivo) {
+  const credenciales = JSON.parse(await archivo.text());
+  const { private_key, client_email } = credenciales;
+  
   // Generar JWT
-  const encodedHeader = btoa(JSON.stringify(header));
-  const encodedClaimSet = btoa(JSON.stringify(claimSet));
-  const signature = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    await importPKCS8(private_key),
-    new TextEncoder().encode(`${encodedHeader}.${encodedClaimSet}`)
-  );
+  const encabezado = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const fechaActual = Math.floor(Date.now() / 1000);
+  const cuerpo = btoa(JSON.stringify({
+    iss: client_email,
+    scope: "https://www.googleapis.com/auth/indexing",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: fechaActual + 3500,
+    iat: fechaActual
+  }));
 
-  const jwt = `${encodedHeader}.${encodedClaimSet}.${btoa(String.fromCharCode(...new Uint8Array(signature))}`;
+  const firma = await generarFirma(`${encabezado}.${cuerpo}`, private_key);
+  const jwt = `${encabezado}.${cuerpo}.${firma}`;
 
-  // Obtener token de acceso
-  const response = await fetch('https://oauth2.googleapis.com/token', {
+  // Obtener token
+  const respuesta = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   });
 
-  const data = await response.json();
-  return data.access_token;
+  const datos = await respuesta.json();
+  if (!respuesta.ok) throw new Error(datos.error || 'Error de autenticación');
+  return datos;
 }
 
-async function sendRequest(url, type, token) {
-  const response = await fetch('https://indexing.googleapis.com/v3/urlNotifications:publish', {
-    method: 'POST',
-    body: JSON.stringify({ url: url.trim(), type: type }),
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`
-    }
-  });
-
-  return { url, status: response.status };
-}
-
-// Helper para importar clave privada
-async function importPKCS8(pem) {
-  const pemContents = pem.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\n/g, '');
-  const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
-  return crypto.subtle.importKey(
+async function generarFirma(datos, clavePrivada) {
+  const clave = await crypto.subtle.importKey(
     'pkcs8',
-    binaryDer,
+    new Uint8Array([...atob(clavePrivada.replace(/-+(BEGIN|END) PRIVATE KEY-+/g, ''))].map(c => c.charCodeAt(0))),
     { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    true,
+    false,
     ['sign']
   );
+
+  const firma = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', clave, new TextEncoder().encode(datos));
+  return btoa(String.fromCharCode(...new Uint8Array(firma))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function enviarPeticionAPI(url, tipo, token) {
+  try {
+    const respuesta = await fetch(API_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        url: url.startsWith('http') ? url : `https://${url}`,
+        type: tipo
+      })
+    });
+
+    const datos = await respuesta.json();
+    return {
+      exito: respuesta.ok,
+      url,
+      mensaje: datos.error ? datos.error.message : 'Procesado correctamente'
+    };
+
+  } catch (error) {
+    return { exito: false, url, mensaje: error.message };
+  }
 }
